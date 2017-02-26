@@ -7,12 +7,16 @@
 
 extern crate libc;
 extern crate crossbeam;
+extern crate num_cpus;
 
+use crossbeam::sync::chase_lev;
+use crossbeam::sync::chase_lev::Steal::*;
+use libc::{c_void, c_int, size_t};
 use std::io::{Read, Write, ErrorKind};
 use std::ptr::copy;
-use std::thread;
 use std::fs::File;
 use std::os::unix::io::FromRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
 
 struct Tables {
@@ -69,41 +73,11 @@ impl Tables {
 
 /// Finds the first position at which `b` occurs in `s`.
 fn memchr(h: &[u8], n: u8) -> Option<usize> {
-    use libc::{c_void, c_int, size_t};
-    let res = unsafe {
-        libc::memchr(h.as_ptr() as *const c_void, n as c_int, h.len() as size_t)
-    };
+    let res = unsafe { libc::memchr(h.as_ptr() as *const c_void, n as c_int, h.len() as size_t) };
     if res.is_null() {
-        None
-    } else {
-        Some(res as usize - h.as_ptr() as usize)
+        return None
     }
-}
-
-/// A mutable iterator over DNA sequences
-struct MutDnaSeqs<'a> { s: &'a mut [u8] }
-fn mut_dna_seqs<'a>(s: &'a mut [u8]) -> MutDnaSeqs<'a> {
-    MutDnaSeqs { s: s }
-}
-impl<'a> Iterator for MutDnaSeqs<'a> {
-    type Item = &'a mut [u8];
-
-    fn next(&mut self) -> Option<&'a mut [u8]> {
-        let tmp = std::mem::replace(&mut self.s, &mut []);
-        let tmp = match memchr(tmp, b'\n') {
-            Some(i) => &mut tmp[i + 1 ..],
-            None => return None,
-        };
-        let (seq, tmp) = match memchr(tmp, b'>') {
-            Some(i) => tmp.split_at_mut(i),
-            None => {
-                let len = tmp.len();
-                tmp.split_at_mut(len)
-            }
-        };
-        self.s = tmp;
-        Some(seq)
-    }
+    Some(res as usize - h.as_ptr() as usize)
 }
 
 /// Length of a normal line without the terminating \n.
@@ -158,29 +132,6 @@ fn reverse_complement(seq: &mut [u8], tables: &Tables) {
     }
 }
 
-struct Racy<T>(T);
-unsafe impl<T: 'static> Send for Racy<T> {}
-
-/// Executes a closure in parallel over the given iterator over mutable slice.
-/// The closure `f` is run in parallel with an element of `iter`.
-fn parallel<'a, I, T, F>(iter: I, ref f: F)
-        where T: 'static + Send + Sync,
-              I: Iterator<Item=&'a mut [T]>,
-              F: Fn(&mut [T]) + Sync {
-    let jhs = iter.map(|chunk| {
-        // Need to convert `f` and `chunk` to something that can cross the task
-        // boundary.
-        let f = Racy(f as *const F as *const usize);
-        let raw = Racy((&mut chunk[0] as *mut T, chunk.len()));
-        thread::spawn(move|| {
-            let f = f.0 as *const F;
-            let raw = raw.0;
-            unsafe { (*f)(std::slice::from_raw_parts_mut(raw.0, raw.1)) }
-        })
-    }).collect::<Vec<_>>();
-    for jh in jhs { jh.join().unwrap(); }
-}
-
 fn file_size(f: &mut File) -> std::io::Result<usize> {
     Ok(f.metadata()?.len() as usize)
 }
@@ -196,11 +147,14 @@ fn mend<'a, T>(a: &'a mut [T], b: &'a mut [T]) -> &'a mut [T] {
 fn main() {
     let mut stdin = unsafe { File::from_raw_fd(0) };
     let size = file_size(&mut stdin).unwrap_or(1024 * 1024);
+
     let mut buf = vec![0; size];
-    let (mut data, mut buf) = buf.split_at_mut(0);
+    let read_finished = &AtomicBool::new(false);
+    let tables = &Tables::new();
 
     crossbeam::scope(|scope| {
-        // This thread reads from stdin and sends each chunk of input back to the main thread.
+        let (mut data, mut buf) = buf.split_at_mut(0);
+        // The reader thread reads from stdin and sends each chunk of input to the dispatch thread.
         let (reader_tx, reader_rx) = channel();
         scope.spawn(move || {
             while !buf.is_empty() {
@@ -211,22 +165,54 @@ fn main() {
                     Ok(n) => {
                         let (new_data, tail) = {buf}.split_at_mut(n);
                         buf = tail;
-                        reader_tx.send(new_data);
+                        reader_tx.send(new_data).expect("reader_tx failed");
                     }
                 }
             }
         });
 
-        while let Ok(new_data) = reader_rx.recv() {
-            let old_data = data;
-            data = mend(old_data, new_data);
+        // The worker threads process each sequence in the work queue.
+        let (mut work_queue, work_stealer) = chase_lev::deque();
+        for _ in 0..num_cpus::get() - 1 {
+            let work_stealer = work_stealer.clone();
+            scope.spawn(move || {
+                loop {
+                    match work_stealer.steal() {
+                        Data(seq) => reverse_complement(seq, tables),
+                        Empty if read_finished.load(Ordering::SeqCst) => break,
+                        Empty | Abort => continue,
+                    }
+                }
+            });
         }
+
+        // The main thread receives inpupt from the reader thread, splits it into sequences,
+        // and puts the sequences into the work queue.
+        //scope.spawn(move || {
+            let mut bytes_read = 0;
+            while let Ok(new_data) = reader_rx.recv() {
+                bytes_read += new_data.len();
+                let old_data = data;
+                data = mend(old_data, new_data);
+
+                while !data.is_empty() {
+                    data = match memchr(data, b'\n') {
+                        Some(i) => {data}.split_at_mut(i + 1).1,
+                        None => continue
+                    };
+                    let (seq, tail) = match memchr(data, b'>') {
+                        Some(i) => {data}.split_at_mut(i),
+                        None if bytes_read == size => (data, &mut [][..]),
+                        None => continue // TODO: final chunk
+                    };
+                    work_queue.push(seq);
+                    data = tail;
+                }
+            }
+            read_finished.store(true, Ordering::SeqCst);
+        //});
     });
 
-    /*
-    let tables = &Tables::new();
-    parallel(mut_dna_seqs(&mut data), |seq| reverse_complement(seq, tables));
     let stdout = std::io::stdout();
-    stdout.lock().write_all(&data).unwrap();
-    */
+    stdout.lock().write_all(&buf).unwrap();
 }

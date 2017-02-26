@@ -6,6 +6,7 @@ authors = ["Matt Brubeck <mbrubeck@limpet.net>"]
 [dependencies]
 crossbeam = "0.2"
 libc = "0.2"
+num_cpus = "1.0"
 
 [profile.release]
 lto = true
