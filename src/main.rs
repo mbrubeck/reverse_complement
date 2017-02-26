@@ -9,8 +9,6 @@ extern crate libc;
 extern crate crossbeam;
 extern crate num_cpus;
 
-use crossbeam::sync::chase_lev;
-use crossbeam::sync::chase_lev::Steal::*;
 use libc::{c_void, c_int, size_t};
 use std::io::{Read, Write, ErrorKind};
 use std::ptr::copy;
@@ -171,46 +169,29 @@ fn main() {
             }
         });
 
-        // The worker threads process each sequence in the work queue.
-        let (mut work_queue, work_stealer) = chase_lev::deque();
-        for _ in 0..num_cpus::get() - 1 {
-            let work_stealer = work_stealer.clone();
-            scope.spawn(move || {
-                loop {
-                    match work_stealer.steal() {
-                        Data(seq) => reverse_complement(seq, tables),
-                        Empty if read_finished.load(Ordering::SeqCst) => break,
-                        Empty | Abort => continue,
-                    }
-                }
-            });
-        }
-
         // The main thread receives inpupt from the reader thread, splits it into sequences,
         // and puts the sequences into the work queue.
-        //scope.spawn(move || {
-            let mut bytes_read = 0;
-            while let Ok(new_data) = reader_rx.recv() {
-                bytes_read += new_data.len();
-                let old_data = data;
-                data = mend(old_data, new_data);
+        let mut bytes_read = 0;
+        while let Ok(new_data) = reader_rx.recv() {
+            bytes_read += new_data.len();
+            let old_data = data;
+            data = mend(old_data, new_data);
 
-                while !data.is_empty() {
-                    data = match memchr(data, b'\n') {
-                        Some(i) => {data}.split_at_mut(i + 1).1,
-                        None => continue
-                    };
-                    let (seq, tail) = match memchr(data, b'>') {
-                        Some(i) => {data}.split_at_mut(i),
-                        None if bytes_read == size => (data, &mut [][..]),
-                        None => continue // TODO: final chunk
-                    };
-                    work_queue.push(seq);
-                    data = tail;
-                }
+            while !data.is_empty() {
+                data = match memchr(data, b'\n') {
+                    Some(i) => {data}.split_at_mut(i + 1).1,
+                    None => continue
+                };
+                let (seq, tail) = match memchr(data, b'>') {
+                    Some(i) => {data}.split_at_mut(i),
+                    None if bytes_read == size => (data, &mut [][..]),
+                    None => continue // TODO: final chunk
+                };
+                scope.spawn(move || reverse_complement(seq, tables));
+                data = tail;
             }
-            read_finished.store(true, Ordering::SeqCst);
-        //});
+        }
+        read_finished.store(true, Ordering::SeqCst);
     });
 
     let stdout = std::io::stdout();
